@@ -14,9 +14,13 @@ import win32clipboard
 from PIL import Image, ImageGrab
 
 import config
-from config import IMAGE_EXTS
+from config import IMAGE_EXTS, VIDEO_EXTS
 from core import file_ops
 from core.naming import NamingScheme, compute_start
+from core.wechat_uia import (
+    get_chat_info, sanitize_folder_name, is_nav_disabled,
+    click_view_original_button,
+)
 
 
 def list_visible_windows(exclude_hwnd=None):
@@ -42,19 +46,29 @@ class WeChatDownloader:
       3. 循环：Ctrl+S -> 监控目录中新文件 -> 重命名 1001.jpg -> 方向键切下一张
     """
 
+    DIRECTION_KEYS = {'向右': 'right', '向左': 'left'}
+
     def __init__(self, image_folder, count, wechat_save_src=None,
-                 next_key='right', naming=None, start_index=1001, log_cb=None, stop_event=None,
-                 selected_hwnd=None, mode='ctrl_s'):
+                 direction='向右', naming=None, start_index=1001, log_cb=None, stop_event=None,
+                 selected_hwnd=None, mode='ctrl_s', use_chat_folder=True,
+                 download_original_video=True):
         self.image_folder = image_folder
+        self.base_image_folder = image_folder
         self.count = count
         self.wechat_save_src = wechat_save_src  # 可选：微信默认保存目录
-        self.next_key = next_key
+        # 切图方向同时决定按哪个方向键、以及检查哪个导航按钮是否到边界
+        self.direction = direction if direction in self.DIRECTION_KEYS else '向右'
+        self.next_key = self.DIRECTION_KEYS[self.direction]
+        self.nav_dir = 'left' if self.direction == '向左' else 'right'
         self.naming = naming or NamingScheme.from_preset('1001起序')
         self.start_index = start_index
         self.log = log_cb or (lambda msg, level="info": None)
         self.stop_event = stop_event or threading.Event()
         self.selected_hwnd = selected_hwnd  # 用户手动选择的微信窗口句柄
         self.mode = mode  # 'ctrl_s' | 'clipboard'
+        self.use_chat_folder = use_chat_folder  # 是否按微信会话名建子文件夹
+        self.download_original_video = download_original_video  # 视频优先下载原文件
+        self.chat_name = ''
         self.window_title = config.GUI_CONF.get('window_title', '微信图片下载工具')
         self._last_src = None  # 上一张成功保存的剪贴板源路径（用于排除残留）
         self.active_hwnd = None  # 实际用于置顶/聚焦的微信窗口句柄
@@ -388,10 +402,12 @@ class WeChatDownloader:
                 ext = os.path.splitext(src)[1].lower() or '.jpg'
                 target = os.path.join(self.image_folder, f"{base}{ext}")
                 try:
+                    file_ops.ensure_writable(target)
                     if os.path.abspath(os.path.dirname(src)) == os.path.abspath(self.image_folder):
                         os.rename(src, target)
                     else:
                         shutil.move(src, target)
+                    file_ops.ensure_writable(target)
                     return target
                 except Exception:
                     return None
@@ -446,6 +462,45 @@ class WeChatDownloader:
             time.sleep(0.15)
         return (None, None)
 
+    def _get_original_video(self, compressed_src, timeout=12.0):
+        """点击「查看原视频」拿到微信落盘的原文件，返回原文件路径或 None。
+
+        Ctrl+C 拿到的视频是微信压缩版（几百 KB）；点「查看原视频」后微信会在
+        同目录生成 ``<原名>_raw<扩展名>`` 原文件（体积大很多）。这里点击按钮后
+        轮询等待该文件出现且大小稳定，再交给调用方复制。失败时返回 None，
+        调用方自动回退到压缩版，不中断下载。
+        """
+        base, ext = os.path.splitext(compressed_src)
+        raw_path = base + '_raw' + ext
+        try:
+            clicked = click_view_original_button(self.active_hwnd or self.selected_hwnd)
+        except Exception:
+            clicked = None
+        if not clicked:
+            return None
+
+        self.log("已点击「查看原视频」，等待原文件落盘…", "info")
+        deadline = time.time() + timeout
+        last_size = -1
+        stable = 0
+        while time.time() < deadline:
+            if self.stop_event.is_set():
+                return None
+            try:
+                if os.path.exists(raw_path):
+                    size = os.path.getsize(raw_path)
+                    if size > 0 and size == last_size:
+                        stable += 1
+                        if stable >= 2:  # 连续两次大小一致，认为写入完成
+                            return raw_path
+                    else:
+                        stable = 0
+                    last_size = size
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return None
+
     def _clipboard_copy_image(self, base, max_attempts=4):
         """发送 Ctrl+C（必要时多次重发），从剪贴板读取图片保存为 base（文件名基础名）。
         成功返回 (True, ext, src)；全部失败返回 (False, None, None)。
@@ -460,7 +515,8 @@ class WeChatDownloader:
                 return False, None, None
 
             # 每次尝试前重新抢回微信窗口焦点，避免焦点漂移导致 Ctrl+C 落空
-            focus_hwnd = self.selected_hwnd or self.active_hwnd
+            # active_hwnd 可能是自动纠正后的图片查看器，优先于用户手选的窗口
+            focus_hwnd = self.active_hwnd or self.selected_hwnd
             if focus_hwnd:
                 try:
                     win32gui.ShowWindow(focus_hwnd, win32con.SW_RESTORE)
@@ -480,6 +536,7 @@ class WeChatDownloader:
             if kind == 'image':
                 target = os.path.join(self.image_folder, f"{base}.png")
                 try:
+                    file_ops.ensure_writable(target)
                     data.save(target, 'PNG')
                     return True, '.png', None
                 except Exception as e:
@@ -488,9 +545,21 @@ class WeChatDownloader:
             if kind == 'files':
                 src = data[0]
                 ext = os.path.splitext(src)[1].lower() or '.png'
+                # 视频：优先拿「查看原视频」的原文件，失败则回退压缩版
+                if self.download_original_video and ext in VIDEO_EXTS:
+                    original = self._get_original_video(src)
+                    if original:
+                        src = original
+                        ext = os.path.splitext(src)[1].lower() or ext
+                        size_mb = os.path.getsize(src) / 1024 / 1024
+                        self.log(f"使用原视频文件（{size_mb:.1f} MB）", "success")
                 target = os.path.join(self.image_folder, f"{base}{ext}")
                 try:
+                    # 微信复制来的源文件常带只读属性，copy2 会把它带到目标；
+                    # 覆盖已存在的只读文件也会失败，所以前后都清一次。
+                    file_ops.ensure_writable(target)
                     shutil.copy2(src, target)
+                    file_ops.ensure_writable(target)
                     return True, ext, src
                 except Exception as e:
                     self.log(f"复制文件失败：{e}", "warning")
@@ -502,8 +571,67 @@ class WeChatDownloader:
 
         return False, None, None
 
+    def _apply_chat_folder(self, hwnd):
+        """读取当前微信会话名，把保存目录切到同名子文件夹。
+
+        识别失败时保持原目录不变，不影响下载主流程。
+        返回最终用于置顶/聚焦的窗口句柄（可能自动纠正为查看器窗口）。
+        """
+        if not hwnd:
+            self.log("没有捕获到微信窗口，无法识别会话，图片保存到原目录", "warning")
+            return hwnd
+        try:
+            info = get_chat_info(hwnd)
+        except Exception as e:
+            self.log(f"识别微信会话失败：{e}，图片保存到原目录", "warning")
+            return hwnd
+
+        if not info:
+            self.log("未识别到微信图片查看器会话，图片保存到原目录", "warning")
+            return hwnd
+
+        viewer_hwnd = info.get('viewer_hwnd')
+        if viewer_hwnd and viewer_hwnd != hwnd:
+            try:
+                title = win32gui.GetWindowText(viewer_hwnd)
+            except Exception:
+                title = '图片和视频'
+            self.log(f"已自动定位到微信查看器窗口：{title}", "input")
+            hwnd = viewer_hwnd
+            self.active_hwnd = hwnd
+
+        name = (info.get('name') or '').strip()
+        chat_id = info.get('chat_id') or ''
+        kind = '群聊' if info.get('is_group') else '联系人'
+        if not name:
+            self.log(
+                f"已识别会话 ID（{kind}）：{chat_id}，但未捕获到名称；"
+                "请重新打开该图片查看器后再下载，以便记录群名。图片先保存到原目录",
+                "warning",
+            )
+            return hwnd
+
+        safe = sanitize_folder_name(name)
+        if not safe:
+            self.log(f"会话名「{name}」不能用作文件夹名，图片保存到原目录", "warning")
+            return hwnd
+
+        target = os.path.join(self.base_image_folder, safe)
+        if os.path.exists(target) and not os.path.isdir(target):
+            self.log(f"子文件夹路径被同名文件占用：{target}，图片保存到原目录", "warning")
+            return hwnd
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as e:
+            self.log(f"创建会话子文件夹失败：{e}，图片保存到原目录", "warning")
+            return hwnd
+
+        self.chat_name = name
+        self.image_folder = target
+        self.log(f"已识别会话：{name}（{kind}），保存到子文件夹「{safe}」", "input")
+        return hwnd
+
     def run(self):
-        file_ops.ensure_folder(self.image_folder)
         if not self._countdown(3):
             self.log("下载已取消", "warning")
             return
@@ -519,6 +647,11 @@ class WeChatDownloader:
             if hwnd:
                 self.log("未手动选择窗口，已自动捕获前台窗口（请确保微信已置顶）", "warning")
         self.active_hwnd = hwnd
+
+        if self.use_chat_folder:
+            hwnd = self._apply_chat_folder(hwnd)
+
+        file_ops.ensure_folder(self.image_folder)
 
         # 根据命名方案计算实际起始序号（避免覆盖文件夹已有同名文件）
         self.seq = compute_start(self.image_folder, self.naming)
@@ -571,6 +704,7 @@ class WeChatDownloader:
                     except Exception:
                         pass
                     target = os.path.join(self.image_folder, f"{base}{ext}")
+                    file_ops.ensure_writable(target)
                     self._fill_save_dialog(dialog_hwnd, target)
                     self._wait_window_close(dialog_hwnd, timeout=6.0)
                     time.sleep(0.5)
@@ -604,6 +738,18 @@ class WeChatDownloader:
                 else:
                     self.log(f"第 {i+1} 张保存失败：微信未聚焦或默认保存目录不可访问，已停止", "error")
                     break
+
+            # 自动结束：导航按钮被禁用说明已到当前方向的边界，不再切图
+            boundary = '第一张' if self.direction == '向左' else '最后一张'
+            try:
+                if is_nav_disabled(hwnd, self.nav_dir):
+                    # Qt 状态可能晚一拍，短间隔再确认一次，避免误停
+                    time.sleep(0.2)
+                    if is_nav_disabled(hwnd, self.nav_dir):
+                        self.log(f"已是{boundary}，自动结束", "success")
+                        break
+            except Exception:
+                pass
 
             # 切到下一张
             pyautogui.press(self.next_key)

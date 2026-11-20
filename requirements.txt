@@ -2,4 +2,5 @@ customtkinter>=5.2.0
 Pillow>=9.0.0
 pywin32>=306
 pyautogui>=0.9.54
+uiautomation>=2.0.0
 pyinstaller>=6.0
